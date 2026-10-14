@@ -67,15 +67,25 @@ button{border:0;border-radius:9px;padding:10px 14px;background:var(--accent);col
 <script>
 const API = 'api.php';
 let tasks = [], currentName = '', pollTimer = null, busy = false;
+let editingTaskId = null;
+let pollPaused = false;
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const statusClass = s => s.toLowerCase().replace(/\s+/g,'-');
 function message(id, text, type='notice') { const el=$(id); el.textContent=text; el.className='notice '+type; el.classList.remove('hidden'); }
 function hideMessage(id){$(id).classList.add('hidden')}
 async function api(action, data={}) {
- const r=await fetch(API+'?action='+encodeURIComponent(action), {method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
- let j; try{j=await r.json()}catch(e){throw new Error('Server returned an invalid response. Check PHP/database setup.')}
- if(!r.ok || !j.ok) throw new Error(j.error || 'Request failed'); return j;
+  const r=await fetch(API+'?action='+encodeURIComponent(action), {method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  let j; try{j=await r.json()}catch(e){throw new Error('Server returned an invalid response. Check PHP/database setup.')}
+  if(!r.ok || !j.ok) throw new Error(j.error || 'Request failed'); return j;
+}
+function trackEditing(id){
+  editingTaskId = id;
+  pollPaused = true;
+}
+function clearEditing(){
+  editingTaskId = null;
+  pollPaused = false;
 }
 $('loginForm').addEventListener('submit', async e=>{
  e.preventDefault(); $('loginBtn').disabled=true; hideMessage('loginMessage');
@@ -87,7 +97,7 @@ $('loginForm').addEventListener('submit', async e=>{
 });
 async function showApp(){
  $('loginPanel').classList.add('hidden'); $('appPanel').classList.remove('hidden'); $('headerSession').classList.remove('hidden'); $('userLabel').textContent='Signed in as '+currentName;
- await loadTasks(); if(pollTimer)clearInterval(pollTimer); pollTimer=setInterval(()=>loadTasks(true),5000);
+  await loadTasks(); if(pollTimer)clearInterval(pollTimer); pollTimer=setInterval(()=>{ if(!pollPaused) loadTasks(true); },5000);
 }
 async function loadTasks(silent=false){
  if(busy)return; busy=true;
@@ -108,7 +118,31 @@ function render(){
  const q=$('searchFilter').value.toLowerCase(), st=$('statusFilter').value, dep=$('deptFilter').value;
  const filtered=tasks.filter(t=>(!q||[t.title,t.description,t.owner,t.department,t.notes].join(' ').toLowerCase().includes(q))&&(!st||t.status===st)&&(!dep||t.department===dep));
  const groups={}; filtered.forEach(t=>(groups[t.category]??=[]).push(t));
- $('taskContainer').innerHTML=Object.keys(groups).length?Object.entries(groups).map(([cat,arr])=>'<h2 class="section-title">'+esc(cat)+' <span class="muted small">('+arr.length+')</span></h2><div class="task-list">'+arr.map(taskCard).join('')+'</div>').join(''):'<div class="panel" style="padding:20px">No tasks match these filters.</div>';
+  // Remember editing values before re-render
+  let editState = null;
+  if (editingTaskId !== null) {
+    const cardEl = $('taskContainer').querySelector('.task[data-id="'+editingTaskId+'"]');
+    if (cardEl) {
+      editState = { id: editingTaskId };
+      cardEl.querySelectorAll('[data-field]').forEach(el => {
+        if (el.dataset.field) editState[el.dataset.field] = el.value;
+      });
+    }
+  }
+  $('taskContainer').innerHTML=Object.keys(groups).length?Object.entries(groups).map(([cat,arr])=>'<h2 class="section-title">'+esc(cat)+' <span class="muted small">('+arr.length+')</span></h2><div class="task-list">'+arr.map(taskCard).join('')+'</div>').join(''):'<div class="panel" style="padding:20px">No tasks match these filters.</div>';
+  // Restore editing values
+  if (editState) {
+    const cardEl = $('taskContainer').querySelector('.task[data-id="'+editState.id+'"]');
+    if (cardEl) {
+      Object.keys(editState).forEach(k => {
+        if (k === 'id') return;
+        const el = cardEl.querySelector('[data-field="'+k+'"]');
+        if (el && document.activeElement !== el) {
+          el.value = editState[k];
+        }
+      });
+    }
+  }
 }
 function taskCard(t){
  return `<article class="task" data-id="${t.id}">
@@ -123,13 +157,29 @@ function taskCard(t){
  <div class="task-actions"><button data-save="${t.id}">Save update</button></div></article>`;
 }
 $('taskContainer').addEventListener('click',async e=>{
- const btn=e.target.closest('button[data-save]');if(!btn)return;
- const card=btn.closest('.task'), id=Number(btn.dataset.save), payload={id};
- card.querySelectorAll('[data-field]').forEach(el=>payload[el.dataset.field]=el.value);
- btn.disabled=true;btn.textContent='Saving…';
- try{await api('update',payload);message('appMessage','Task updated successfully. Other users will see the change shortly.','success');await loadTasks(true)}
- catch(err){message('appMessage',err.message,'error')}
- finally{btn.disabled=false;btn.textContent='Save update'}
+  const btn=e.target.closest('button[data-save]');if(!btn)return;
+  const card=btn.closest('.task'), id=Number(btn.dataset.save), payload={id};
+  card.querySelectorAll('[data-field]').forEach(el=>payload[el.dataset.field]=el.value);
+  btn.disabled=true;btn.textContent='Saving…';
+  clearEditing();
+  try{await api('update',payload);message('appMessage','Task updated successfully. Other users will see the change shortly.','success');await loadTasks(true)}
+  catch(err){message('appMessage',err.message,'error')}
+  finally{btn.disabled=false;btn.textContent='Save update'}
+});
+// Track editing when user changes inputs/selects/textareas
+$('taskContainer').addEventListener('input', e=>{
+  const el = e.target.closest('[data-field]');
+  if(!el)return;
+  const card = el.closest('.task');
+  if(!card)return;
+  trackEditing(Number(card.dataset.id));
+});
+$('taskContainer').addEventListener('change', e=>{
+  const el = e.target.closest('[data-field]');
+  if(!el)return;
+  const card = el.closest('.task');
+  if(!card)return;
+  trackEditing(Number(card.dataset.id));
 });
 ['searchFilter','statusFilter','deptFilter'].forEach(id=>$(id).addEventListener(id==='searchFilter'?'input':'change',render));
 $('refreshBtn').addEventListener('click',()=>loadTasks());
